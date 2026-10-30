@@ -1,114 +1,126 @@
 /**
- * Supabase Client for Frontend
- * Used for real-time subscriptions and direct queries
+ * Real-time polling client (replaces Supabase real-time)
+ * Since SQLite is local and has no WebSocket support,
+ * we use efficient polling against our REST API endpoints.
  */
 
-import { createClient } from '@supabase/supabase-js';
+import api from '../utils/api';
 
-const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
-const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
-
-if (!supabaseUrl || !supabaseAnonKey) {
-  console.warn('⚠️ Supabase environment variables not set. Real-time features will be disabled.');
-}
-
-export const supabase = createClient(
-  supabaseUrl || 'https://placeholder.supabase.co',
-  supabaseAnonKey || 'placeholder-key'
-);
-
-/**
- * Subscribe to real-time queue updates for a doctor
- * @param {string} doctorId - Doctor's UUID
- * @param {Function} callback - Called with updated queue data
- * @returns {Function} Unsubscribe function
- */
-export const subscribeToQueue = (doctorId, callback) => {
-  const channel = supabase
-    .channel(`queue:${doctorId}`)
-    .on(
-      'postgres_changes',
-      {
-        event: '*',
-        schema: 'public',
-        table: 'queue_tokens',
-        filter: `doctor_id=eq.${doctorId}`
-      },
-      (payload) => callback(payload)
-    )
-    .subscribe();
-
-  return () => supabase.removeChannel(channel);
+// No-op supabase stub for any leftover imports
+export const supabase = {
+  channel: () => ({ on: () => ({ subscribe: () => {} }) }),
+  removeChannel: () => {}
 };
 
 /**
- * Subscribe to real-time notifications for a user
- * @param {string} userId - User's UUID
- * @param {Function} callback - Called with new notification
- * @returns {Function} Unsubscribe function
+ * Poll the queue for a doctor every N ms
+ * Mirrors the old subscribeToQueue(doctorId, callback) API
+ * @param {string} doctorId
+ * @param {Function} callback  called with the API response on each poll
+ * @param {number} intervalMs  polling interval (default 5 seconds)
+ * @returns {Function} unsubscribe / stop polling
  */
-export const subscribeToNotifications = (userId, callback) => {
-  const channel = supabase
-    .channel(`notifications:${userId}`)
-    .on(
-      'postgres_changes',
-      {
-        event: 'INSERT',
-        schema: 'public',
-        table: 'notifications',
-        filter: `user_id=eq.${userId}`
-      },
-      (payload) => callback(payload.new)
-    )
-    .subscribe();
+export const subscribeToQueue = (doctorId, callback, intervalMs = 5000) => {
+  let active = true;
 
-  return () => supabase.removeChannel(channel);
+  const poll = async () => {
+    if (!active) return;
+    try {
+      const today = new Date().toISOString().split('T')[0];
+      const { data } = await api.get(`/queue/${doctorId}?date=${today}`);
+      if (data.success) callback({ new: data.data, type: 'POLL' });
+    } catch {
+      // silently ignore network errors during polling
+    }
+    if (active) setTimeout(poll, intervalMs);
+  };
+
+  // Start with a short initial delay
+  setTimeout(poll, 500);
+
+  return () => { active = false; };
 };
 
 /**
- * Subscribe to appointment status changes
- * @param {string} patientId - Patient's UUID
- * @param {Function} callback - Called with updated appointment
- * @returns {Function} Unsubscribe function
+ * Poll notifications for a user
+ * @param {string} userId  (unused – auth is via Bearer token)
+ * @param {Function} callback  called with new notifications array
+ * @param {number} intervalMs
+ * @returns {Function} stop polling
  */
-export const subscribeToAppointments = (patientId, callback) => {
-  const channel = supabase
-    .channel(`appointments:${patientId}`)
-    .on(
-      'postgres_changes',
-      {
-        event: 'UPDATE',
-        schema: 'public',
-        table: 'appointments',
-        filter: `patient_id=eq.${patientId}`
-      },
-      (payload) => callback(payload.new)
-    )
-    .subscribe();
+export const subscribeToNotifications = (userId, callback, intervalMs = 10000) => {
+  let active = true;
+  let lastCount = null;
 
-  return () => supabase.removeChannel(channel);
+  const poll = async () => {
+    if (!active) return;
+    try {
+      const { data } = await api.get('/notifications');
+      if (data.success) {
+        const unread = data.data.filter(n => !n.is_read);
+        // Only call callback when there are new unread notifications
+        if (lastCount === null || unread.length > lastCount) {
+          unread.slice(lastCount ?? 0).forEach(n => callback(n));
+        }
+        lastCount = unread.length;
+      }
+    } catch {
+      // ignore
+    }
+    if (active) setTimeout(poll, intervalMs);
+  };
+
+  setTimeout(poll, 1000);
+  return () => { active = false; };
 };
 
 /**
- * Subscribe to emergency cases (admin)
- * @param {Function} callback - Called with new emergency case
- * @returns {Function} Unsubscribe function
+ * Poll appointment status for a patient
+ * @param {string} patientId  (unused – auth is via token)
+ * @param {Function} callback  called with updated appointment data
+ * @param {number} intervalMs
+ * @returns {Function} stop polling
  */
-export const subscribeToEmergencies = (callback) => {
-  const channel = supabase
-    .channel('emergency_cases')
-    .on(
-      'postgres_changes',
-      {
-        event: 'INSERT',
-        schema: 'public',
-        table: 'emergency_cases'
-      },
-      (payload) => callback(payload.new)
-    )
-    .subscribe();
+export const subscribeToAppointments = (patientId, callback, intervalMs = 8000) => {
+  let active = true;
 
-  return () => supabase.removeChannel(channel);
+  const poll = async () => {
+    if (!active) return;
+    try {
+      const { data } = await api.get('/appointments');
+      if (data.success) callback({ new: data.data, type: 'POLL' });
+    } catch {
+      // ignore
+    }
+    if (active) setTimeout(poll, intervalMs);
+  };
+
+  setTimeout(poll, 1000);
+  return () => { active = false; };
+};
+
+/**
+ * Poll emergency cases (admin)
+ * @param {Function} callback
+ * @param {number} intervalMs
+ * @returns {Function} stop polling
+ */
+export const subscribeToEmergencies = (callback, intervalMs = 10000) => {
+  let active = true;
+
+  const poll = async () => {
+    if (!active) return;
+    try {
+      const { data } = await api.get('/admin/emergency');
+      if (data.success) callback({ new: data.data, type: 'POLL' });
+    } catch {
+      // ignore
+    }
+    if (active) setTimeout(poll, intervalMs);
+  };
+
+  setTimeout(poll, 1000);
+  return () => { active = false; };
 };
 
 export default supabase;

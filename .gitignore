@@ -57,3 +57,19 @@ coverage/
 # Misc
 *.tgz
 *.tar.gz
+
+# Local database files
+backend/data/*.db
+backend/data/*.sqlite
+backend/data/*.sqlite3
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Dependencies
+node_modules/
+venv/
+.venv/
+__pycache__/

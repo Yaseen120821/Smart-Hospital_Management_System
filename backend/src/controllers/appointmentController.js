@@ -1,10 +1,12 @@
 /**
  * Appointment Controller
  * Handles all appointment-related operations
+ * Uses SQLite via better-sqlite3
  */
 
-const { supabaseAdmin } = require('../config/supabase');
-const { generateQueueToken, getPagination, successResponse, errorResponse } = require('../utils/helpers');
+const { v4: uuidv4 } = require('uuid');
+const { db } = require('../config/database');
+const { generateQueueToken, getPagination } = require('../utils/helpers');
 const { sendAppointmentConfirmation } = require('../utils/emailService');
 
 /**
@@ -16,140 +18,96 @@ const bookAppointment = async (req, res) => {
     const { doctor_id, appointment_date, appointment_time, reason, type = 'regular' } = req.body;
 
     // Get patient profile
-    const { data: patient } = await supabaseAdmin
-      .from('patients')
-      .select('id')
-      .eq('user_id', req.user.id)
-      .single();
+    const patient = db.prepare('SELECT id FROM patients WHERE user_id = ?').get(req.user.id);
+    if (!patient) return res.status(404).json({ success: false, message: 'Patient profile not found.' });
 
-    if (!patient) {
-      return res.status(404).json({ success: false, message: 'Patient profile not found.' });
-    }
-
-    // Check if doctor exists and is available
-    const { data: doctor } = await supabaseAdmin
-      .from('doctors')
-      .select('*, users(full_name, email), departments(name)')
-      .eq('id', doctor_id)
-      .single();
-
-    if (!doctor) {
-      return res.status(404).json({ success: false, message: 'Doctor not found.' });
-    }
+    // Check doctor exists
+    const doctor = db.prepare(`
+      SELECT d.*, u.full_name AS doctor_name, u.email AS doctor_email, u.id AS user_uid,
+             dept.name AS dept_name
+      FROM doctors d
+      JOIN users u ON d.user_id = u.id
+      LEFT JOIN departments dept ON d.department_id = dept.id
+      WHERE d.id = ?
+    `).get(doctor_id);
+    if (!doctor) return res.status(404).json({ success: false, message: 'Doctor not found.' });
 
     // Check for double booking - same doctor, date, time
-    const { data: existingAppointment } = await supabaseAdmin
-      .from('appointments')
-      .select('id')
-      .eq('doctor_id', doctor_id)
-      .eq('appointment_date', appointment_date)
-      .eq('appointment_time', appointment_time)
-      .neq('status', 'cancelled')
-      .single();
-
-    if (existingAppointment) {
-      return res.status(409).json({
-        success: false,
-        message: 'This time slot is already booked. Please choose another time.'
-      });
+    const existingAppt = db.prepare(
+      `SELECT id FROM appointments WHERE doctor_id = ? AND appointment_date = ? AND appointment_time = ? AND status != 'cancelled'`
+    ).get(doctor_id, appointment_date, appointment_time);
+    if (existingAppt) {
+      return res.status(409).json({ success: false, message: 'This time slot is already booked. Please choose another time.' });
     }
 
     // Check if patient already has appointment at same time
-    const { data: patientConflict } = await supabaseAdmin
-      .from('appointments')
-      .select('id')
-      .eq('patient_id', patient.id)
-      .eq('appointment_date', appointment_date)
-      .eq('appointment_time', appointment_time)
-      .neq('status', 'cancelled')
-      .single();
-
+    const patientConflict = db.prepare(
+      `SELECT id FROM appointments WHERE patient_id = ? AND appointment_date = ? AND appointment_time = ? AND status != 'cancelled'`
+    ).get(patient.id, appointment_date, appointment_time);
     if (patientConflict) {
-      return res.status(409).json({
-        success: false,
-        message: 'You already have an appointment at this time.'
-      });
+      return res.status(409).json({ success: false, message: 'You already have an appointment at this time.' });
     }
 
     // Generate queue token
-    const { count } = await supabaseAdmin
-      .from('appointments')
-      .select('*', { count: 'exact', head: true })
-      .eq('doctor_id', doctor_id)
-      .eq('appointment_date', appointment_date)
-      .neq('status', 'cancelled');
-
-    const tokenNumber = (count || 0) + 1;
+    const countRow = db.prepare(
+      `SELECT COUNT(*) AS count FROM appointments WHERE doctor_id = ? AND appointment_date = ? AND status != 'cancelled'`
+    ).get(doctor_id, appointment_date);
+    const tokenNumber = (countRow?.count || 0) + 1;
     const queueToken = generateQueueToken('T', tokenNumber);
 
-    // Create appointment
-    const { data: appointment, error } = await supabaseAdmin
-      .from('appointments')
-      .insert({
-        patient_id: patient.id,
-        doctor_id,
-        appointment_date,
-        appointment_time,
-        reason,
-        type,
-        status: 'pending',
-        queue_token: queueToken,
-        token_number: tokenNumber
-      })
-      .select(`
-        *,
-        doctors(*, users(full_name), departments(name)),
-        patients(*, users(full_name, email))
-      `)
-      .single();
+    const appointmentId = uuidv4();
+    const now = new Date().toISOString();
 
-    if (error) {
-      console.error('Appointment creation error:', error);
-      return res.status(500).json({ success: false, message: 'Failed to book appointment.' });
-    }
+    // Create appointment
+    db.prepare(
+      `INSERT INTO appointments (id, patient_id, doctor_id, appointment_date, appointment_time, reason, type, status, queue_token, token_number, created_at, updated_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`
+    ).run(appointmentId, patient.id, doctor_id, appointment_date, appointment_time, reason, type, 'pending', queueToken, tokenNumber, now, now);
 
     // Create queue token record
-    await supabaseAdmin.from('queue_tokens').insert({
-      appointment_id: appointment.id,
-      doctor_id,
-      patient_id: patient.id,
-      token_number: tokenNumber,
-      token_code: queueToken,
-      appointment_date,
-      status: 'waiting'
-    });
+    db.prepare(
+      `INSERT INTO queue_tokens (id, appointment_id, doctor_id, patient_id, token_number, token_code, appointment_date, status, created_at, updated_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?)`
+    ).run(uuidv4(), appointmentId, doctor_id, patient.id, tokenNumber, queueToken, appointment_date, 'waiting', now, now);
 
-    // Create notification for patient
-    await supabaseAdmin.from('notifications').insert({
-      user_id: req.user.id,
-      title: 'Appointment Booked',
-      message: `Your appointment with Dr. ${doctor.users.full_name} on ${appointment_date} at ${appointment_time} has been booked. Token: ${queueToken}`,
-      type: 'appointment'
-    });
+    // Notify patient
+    db.prepare(`INSERT INTO notifications (id, user_id, title, message, type, created_at) VALUES (?,?,?,?,?,?)`)
+      .run(uuidv4(), req.user.id, 'Appointment Booked',
+        `Your appointment with Dr. ${doctor.doctor_name} on ${appointment_date} at ${appointment_time} has been booked. Token: ${queueToken}`,
+        'appointment', now);
 
-    // Create notification for doctor
-    await supabaseAdmin.from('notifications').insert({
-      user_id: doctor.users.id || doctor.user_id,
-      title: 'New Appointment',
-      message: `New appointment booked by ${req.user.full_name} on ${appointment_date} at ${appointment_time}`,
-      type: 'appointment'
-    });
+    // Notify doctor
+    db.prepare(`INSERT INTO notifications (id, user_id, title, message, type, created_at) VALUES (?,?,?,?,?,?)`)
+      .run(uuidv4(), doctor.user_uid, 'New Appointment',
+        `New appointment booked by ${req.user.full_name} on ${appointment_date} at ${appointment_time}`,
+        'appointment', now);
 
     // Send confirmation email (non-blocking)
     sendAppointmentConfirmation(req.user.email, {
       patientName: req.user.full_name,
-      doctorName: doctor.users.full_name,
-      department: doctor.departments?.name || 'General',
+      doctorName: doctor.doctor_name,
+      department: doctor.dept_name || 'General',
       date: appointment_date,
       time: appointment_time,
       token: queueToken
     }).catch(console.error);
 
-    res.status(201).json({
-      success: true,
-      message: 'Appointment booked successfully!',
-      data: appointment
-    });
+    const appointment = db.prepare(`
+      SELECT a.*,
+        d.specialization, d.consultation_fee,
+        du.full_name AS doctor_name, du.avatar_url AS doctor_avatar,
+        dept.name AS department_name,
+        pu.full_name AS patient_name, pu.email AS patient_email
+      FROM appointments a
+      JOIN doctors d ON a.doctor_id = d.id
+      JOIN users du ON d.user_id = du.id
+      LEFT JOIN departments dept ON d.department_id = dept.id
+      JOIN patients p ON a.patient_id = p.id
+      JOIN users pu ON p.user_id = pu.id
+      WHERE a.id = ?
+    `).get(appointmentId);
+
+    res.status(201).json({ success: true, message: 'Appointment booked successfully!', data: appointment });
   } catch (error) {
     console.error('BookAppointment error:', error);
     res.status(500).json({ success: false, message: 'Server error.' });
@@ -165,47 +123,58 @@ const getAppointments = async (req, res) => {
     const { page = 1, limit = 10, status, date } = req.query;
     const { offset } = getPagination(page, limit);
 
-    let query = supabaseAdmin
-      .from('appointments')
-      .select(`
-        *,
-        doctors(id, specialization, consultation_fee, users(full_name, avatar_url), departments(name)),
-        patients(id, blood_group, users(full_name, email, phone, avatar_url))
-      `, { count: 'exact' });
+    let conditions = [];
+    let params = [];
 
-    // Filter by role
     if (req.user.role === 'patient') {
-      const { data: patient } = await supabaseAdmin
-        .from('patients').select('id').eq('user_id', req.user.id).single();
-      if (patient) query = query.eq('patient_id', patient.id);
+      const patient = db.prepare('SELECT id FROM patients WHERE user_id = ?').get(req.user.id);
+      if (patient) { conditions.push('a.patient_id = ?'); params.push(patient.id); }
     } else if (req.user.role === 'doctor') {
-      const { data: doctor } = await supabaseAdmin
-        .from('doctors').select('id').eq('user_id', req.user.id).single();
-      if (doctor) query = query.eq('doctor_id', doctor.id);
+      const doctor = db.prepare('SELECT id FROM doctors WHERE user_id = ?').get(req.user.id);
+      if (doctor) { conditions.push('a.doctor_id = ?'); params.push(doctor.id); }
     }
 
-    // Apply filters
-    if (status) query = query.eq('status', status);
-    if (date) query = query.eq('appointment_date', date);
+    if (status) { conditions.push('a.status = ?'); params.push(status); }
+    if (date) { conditions.push('a.appointment_date = ?'); params.push(date); }
 
-    // Pagination and ordering
-    const { data: appointments, error, count } = await query
-      .order('appointment_date', { ascending: false })
-      .order('appointment_time', { ascending: true })
-      .range(offset, offset + parseInt(limit) - 1);
+    const where = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
 
-    if (error) {
-      return res.status(500).json({ success: false, message: 'Failed to fetch appointments.' });
-    }
+    const appointments = db.prepare(`
+      SELECT a.*,
+        d.specialization, d.consultation_fee,
+        du.full_name AS doctor_name, du.avatar_url AS doctor_avatar,
+        dept.name AS department_name,
+        pu.full_name AS patient_name, pu.email AS patient_email,
+        pu.phone AS patient_phone, pu.avatar_url AS patient_avatar,
+        p.blood_group
+      FROM appointments a
+      JOIN doctors d ON a.doctor_id = d.id
+      JOIN users du ON d.user_id = du.id
+      LEFT JOIN departments dept ON d.department_id = dept.id
+      JOIN patients p ON a.patient_id = p.id
+      JOIN users pu ON p.user_id = pu.id
+      ${where}
+      ORDER BY a.appointment_date DESC, a.appointment_time ASC
+      LIMIT ? OFFSET ?
+    `).all(...params, parseInt(limit), parseInt(offset));
+
+    const totalRow = db.prepare(`
+      SELECT COUNT(*) AS count
+      FROM appointments a
+      JOIN doctors d ON a.doctor_id = d.id
+      JOIN patients p ON a.patient_id = p.id
+      ${where}
+    `).get(...params);
+    const total = totalRow?.count || 0;
 
     res.json({
       success: true,
       data: appointments,
       pagination: {
-        total: count,
+        total,
         page: parseInt(page),
         limit: parseInt(limit),
-        totalPages: Math.ceil(count / limit)
+        totalPages: Math.ceil(total / limit)
       }
     });
   } catch (error) {
@@ -220,21 +189,27 @@ const getAppointments = async (req, res) => {
  */
 const getAppointment = async (req, res) => {
   try {
-    const { data: appointment, error } = await supabaseAdmin
-      .from('appointments')
-      .select(`
-        *,
-        doctors(*, users(full_name, email, phone, avatar_url), departments(name)),
-        patients(*, users(full_name, email, phone, avatar_url)),
-        prescriptions(*),
-        billing(*)
-      `)
-      .eq('id', req.params.id)
-      .single();
+    const appointment = db.prepare(`
+      SELECT a.*,
+        d.specialization, d.consultation_fee, d.bio,
+        du.full_name AS doctor_name, du.email AS doctor_email, du.phone AS doctor_phone, du.avatar_url AS doctor_avatar,
+        dept.name AS department_name,
+        pu.full_name AS patient_name, pu.email AS patient_email, pu.phone AS patient_phone, pu.avatar_url AS patient_avatar,
+        p.blood_group, p.gender, p.date_of_birth
+      FROM appointments a
+      JOIN doctors d ON a.doctor_id = d.id
+      JOIN users du ON d.user_id = du.id
+      LEFT JOIN departments dept ON d.department_id = dept.id
+      JOIN patients p ON a.patient_id = p.id
+      JOIN users pu ON p.user_id = pu.id
+      WHERE a.id = ?
+    `).get(req.params.id);
 
-    if (error || !appointment) {
-      return res.status(404).json({ success: false, message: 'Appointment not found.' });
-    }
+    if (!appointment) return res.status(404).json({ success: false, message: 'Appointment not found.' });
+
+    // Attach prescriptions and billing
+    appointment.prescriptions = db.prepare('SELECT * FROM prescriptions WHERE appointment_id = ?').all(req.params.id);
+    appointment.billing = db.prepare('SELECT * FROM billing WHERE appointment_id = ?').all(req.params.id);
 
     res.json({ success: true, data: appointment });
   } catch (error) {
@@ -244,63 +219,47 @@ const getAppointment = async (req, res) => {
 };
 
 /**
- * Update appointment status (doctor/admin)
+ * Update appointment status
  * PUT /api/appointments/:id/status
  */
 const updateAppointmentStatus = async (req, res) => {
   try {
     const { status, notes } = req.body;
     const validStatuses = ['pending', 'confirmed', 'in_progress', 'completed', 'cancelled', 'no_show'];
+    if (!validStatuses.includes(status)) return res.status(400).json({ success: false, message: 'Invalid status.' });
 
-    if (!validStatuses.includes(status)) {
-      return res.status(400).json({ success: false, message: 'Invalid status.' });
-    }
+    const now = new Date().toISOString();
+    const completedAt = status === 'completed' ? now : null;
 
-    const { data: appointment, error } = await supabaseAdmin
-      .from('appointments')
-      .update({
-        status,
-        doctor_notes: notes,
-        updated_at: new Date().toISOString(),
-        ...(status === 'completed' && { completed_at: new Date().toISOString() })
-      })
-      .eq('id', req.params.id)
-      .select(`*, patients(users(full_name)), doctors(users(full_name))`)
-      .single();
+    db.prepare(
+      `UPDATE appointments SET status = ?, doctor_notes = ?, updated_at = ?, completed_at = COALESCE(?, completed_at) WHERE id = ?`
+    ).run(status, notes, now, completedAt, req.params.id);
 
-    if (error) {
-      return res.status(500).json({ success: false, message: 'Failed to update appointment.' });
-    }
-
-    // Update queue token status
+    // Update queue token
     if (status === 'in_progress') {
-      await supabaseAdmin
-        .from('queue_tokens')
-        .update({ status: 'in_progress' })
-        .eq('appointment_id', req.params.id);
+      db.prepare(`UPDATE queue_tokens SET status = 'in_progress', updated_at = ? WHERE appointment_id = ?`).run(now, req.params.id);
     } else if (status === 'completed') {
-      await supabaseAdmin
-        .from('queue_tokens')
-        .update({ status: 'completed' })
-        .eq('appointment_id', req.params.id);
+      db.prepare(`UPDATE queue_tokens SET status = 'completed', updated_at = ? WHERE appointment_id = ?`).run(now, req.params.id);
     }
+
+    const appointment = db.prepare(`
+      SELECT a.*, p.user_id AS patient_user_id,
+        pu.full_name AS patient_name, du.full_name AS doctor_name
+      FROM appointments a
+      JOIN patients p ON a.patient_id = p.id
+      JOIN users pu ON p.user_id = pu.id
+      JOIN doctors d ON a.doctor_id = d.id
+      JOIN users du ON d.user_id = du.id
+      WHERE a.id = ?
+    `).get(req.params.id);
 
     // Notify patient
-    const patientUserId = appointment.patients?.user_id;
-    if (patientUserId) {
-      await supabaseAdmin.from('notifications').insert({
-        user_id: patientUserId,
-        title: 'Appointment Update',
-        message: `Your appointment status has been updated to: ${status}`,
-        type: 'appointment'
-      });
+    if (appointment?.patient_user_id) {
+      db.prepare(`INSERT INTO notifications (id, user_id, title, message, type, created_at) VALUES (?,?,?,?,?,?)`)
+        .run(uuidv4(), appointment.patient_user_id, 'Appointment Update', `Your appointment status has been updated to: ${status}`, 'appointment', now);
     }
 
-    res.json({
-      success: true,
-      message: `Appointment ${status} successfully.`,
-      data: appointment
-    });
+    res.json({ success: true, message: `Appointment ${status} successfully.`, data: appointment });
   } catch (error) {
     console.error('UpdateAppointmentStatus error:', error);
     res.status(500).json({ success: false, message: 'Server error.' });
@@ -313,30 +272,22 @@ const updateAppointmentStatus = async (req, res) => {
  */
 const cancelAppointment = async (req, res) => {
   try {
-    const { data: appointment } = await supabaseAdmin
-      .from('appointments')
-      .select('*, patients(user_id)')
-      .eq('id', req.params.id)
-      .single();
+    const appointment = db.prepare(`
+      SELECT a.*, p.user_id AS patient_user_id
+      FROM appointments a
+      JOIN patients p ON a.patient_id = p.id
+      WHERE a.id = ?
+    `).get(req.params.id);
 
-    if (!appointment) {
-      return res.status(404).json({ success: false, message: 'Appointment not found.' });
-    }
+    if (!appointment) return res.status(404).json({ success: false, message: 'Appointment not found.' });
 
-    // Only patient who booked or admin can cancel
-    if (req.user.role === 'patient' && appointment.patients?.user_id !== req.user.id) {
+    if (req.user.role === 'patient' && appointment.patient_user_id !== req.user.id) {
       return res.status(403).json({ success: false, message: 'Not authorized.' });
     }
 
-    await supabaseAdmin
-      .from('appointments')
-      .update({ status: 'cancelled', updated_at: new Date().toISOString() })
-      .eq('id', req.params.id);
-
-    await supabaseAdmin
-      .from('queue_tokens')
-      .update({ status: 'cancelled' })
-      .eq('appointment_id', req.params.id);
+    const now = new Date().toISOString();
+    db.prepare(`UPDATE appointments SET status = 'cancelled', updated_at = ? WHERE id = ?`).run(now, req.params.id);
+    db.prepare(`UPDATE queue_tokens SET status = 'cancelled', updated_at = ? WHERE appointment_id = ?`).run(now, req.params.id);
 
     res.json({ success: true, message: 'Appointment cancelled successfully.' });
   } catch (error) {
@@ -353,49 +304,24 @@ const getAvailableSlots = async (req, res) => {
   try {
     const { doctorId } = req.params;
     const { date } = req.query;
+    if (!date) return res.status(400).json({ success: false, message: 'Date is required.' });
 
-    if (!date) {
-      return res.status(400).json({ success: false, message: 'Date is required.' });
-    }
-
-    // Get doctor availability
-    // Use 'long' then toLowerCase() — 'lowercase' is not a valid weekday option
     const dayOfWeek = new Date(date + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'long' }).toLowerCase();
-    const { data: availability } = await supabaseAdmin
-      .from('doctor_availability')
-      .select('*')
-      .eq('doctor_id', doctorId)
-      .eq('day_of_week', dayOfWeek)
-      .eq('is_available', true)
-      .single();
+    const availability = db.prepare(
+      `SELECT * FROM doctor_availability WHERE doctor_id = ? AND day_of_week = ? AND is_available = 1`
+    ).get(doctorId, dayOfWeek);
 
-    if (!availability) {
-      return res.json({ success: true, data: [], message: 'Doctor not available on this day.' });
-    }
+    if (!availability) return res.json({ success: true, data: [], message: 'Doctor not available on this day.' });
 
-    // Generate all slots
     const { generateTimeSlots } = require('../utils/helpers');
-    const allSlots = generateTimeSlots(
-      availability.start_time,
-      availability.end_time,
-      availability.slot_duration || 30
-    );
+    const allSlots = generateTimeSlots(availability.start_time, availability.end_time, availability.slot_duration || 30);
 
-    // Get booked slots
-    const { data: bookedAppointments } = await supabaseAdmin
-      .from('appointments')
-      .select('appointment_time')
-      .eq('doctor_id', doctorId)
-      .eq('appointment_date', date)
-      .neq('status', 'cancelled');
+    const booked = db.prepare(
+      `SELECT appointment_time FROM appointments WHERE doctor_id = ? AND appointment_date = ? AND status != 'cancelled'`
+    ).all(doctorId, date);
+    const bookedTimes = booked.map(a => a.appointment_time);
 
-    const bookedTimes = bookedAppointments?.map(a => a.appointment_time) || [];
-
-    // Filter available slots
-    const availableSlots = allSlots.map(slot => ({
-      time: slot,
-      available: !bookedTimes.includes(slot)
-    }));
+    const availableSlots = allSlots.map(slot => ({ time: slot, available: !bookedTimes.includes(slot) }));
 
     res.json({ success: true, data: availableSlots });
   } catch (error) {
@@ -405,29 +331,32 @@ const getAvailableSlots = async (req, res) => {
 };
 
 /**
- * Get today's appointments summary (for dashboard)
+ * Get today's appointments
  * GET /api/appointments/today
  */
 const getTodayAppointments = async (req, res) => {
   try {
     const today = new Date().toISOString().split('T')[0];
-
-    let query = supabaseAdmin
-      .from('appointments')
-      .select('*, doctors(users(full_name)), patients(users(full_name))')
-      .eq('appointment_date', today);
+    let conditions = ['a.appointment_date = ?'];
+    let params = [today];
 
     if (req.user.role === 'doctor') {
-      const { data: doctor } = await supabaseAdmin
-        .from('doctors').select('id').eq('user_id', req.user.id).single();
-      if (doctor) query = query.eq('doctor_id', doctor.id);
+      const doctor = db.prepare('SELECT id FROM doctors WHERE user_id = ?').get(req.user.id);
+      if (doctor) { conditions.push('a.doctor_id = ?'); params.push(doctor.id); }
     }
 
-    const { data: appointments, error } = await query.order('appointment_time');
-
-    if (error) {
-      return res.status(500).json({ success: false, message: 'Failed to fetch today appointments.' });
-    }
+    const appointments = db.prepare(`
+      SELECT a.*,
+        du.full_name AS doctor_name,
+        pu.full_name AS patient_name
+      FROM appointments a
+      JOIN doctors d ON a.doctor_id = d.id
+      JOIN users du ON d.user_id = du.id
+      JOIN patients p ON a.patient_id = p.id
+      JOIN users pu ON p.user_id = pu.id
+      WHERE ${conditions.join(' AND ')}
+      ORDER BY a.appointment_time
+    `).all(...params);
 
     res.json({ success: true, data: appointments });
   } catch (error) {
@@ -437,11 +366,6 @@ const getTodayAppointments = async (req, res) => {
 };
 
 module.exports = {
-  bookAppointment,
-  getAppointments,
-  getAppointment,
-  updateAppointmentStatus,
-  cancelAppointment,
-  getAvailableSlots,
-  getTodayAppointments
+  bookAppointment, getAppointments, getAppointment,
+  updateAppointmentStatus, cancelAppointment, getAvailableSlots, getTodayAppointments
 };

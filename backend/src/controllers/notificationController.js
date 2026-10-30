@@ -1,28 +1,16 @@
 /**
  * Notification Controller
+ * Uses SQLite via better-sqlite3
  */
 
-const { supabaseAdmin } = require('../config/supabase');
+const { db } = require('../config/database');
 
-/**
- * Get user notifications
- * GET /api/notifications
- */
 const getNotifications = async (req, res) => {
   try {
-    const { data: notifications, error } = await supabaseAdmin
-      .from('notifications')
-      .select('*')
-      .eq('user_id', req.user.id)
-      .order('created_at', { ascending: false })
-      .limit(50);
-
-    if (error) {
-      return res.status(500).json({ success: false, message: 'Failed to fetch notifications.' });
-    }
-
+    const notifications = db.prepare(`
+      SELECT * FROM notifications WHERE user_id = ? ORDER BY created_at DESC LIMIT 50
+    `).all(req.user.id);
     const unreadCount = notifications.filter(n => !n.is_read).length;
-
     res.json({ success: true, data: notifications, unread_count: unreadCount });
   } catch (error) {
     console.error('GetNotifications error:', error);
@@ -30,18 +18,10 @@ const getNotifications = async (req, res) => {
   }
 };
 
-/**
- * Mark notification as read
- * PUT /api/notifications/:id/read
- */
 const markAsRead = async (req, res) => {
   try {
-    await supabaseAdmin
-      .from('notifications')
-      .update({ is_read: true, updated_at: new Date().toISOString() })
-      .eq('id', req.params.id)
-      .eq('user_id', req.user.id);
-
+    db.prepare('UPDATE notifications SET is_read = 1, updated_at = ? WHERE id = ? AND user_id = ?')
+      .run(new Date().toISOString(), req.params.id, req.user.id);
     res.json({ success: true, message: 'Notification marked as read.' });
   } catch (error) {
     console.error('MarkAsRead error:', error);
@@ -49,18 +29,10 @@ const markAsRead = async (req, res) => {
   }
 };
 
-/**
- * Mark all notifications as read
- * PUT /api/notifications/read-all
- */
 const markAllAsRead = async (req, res) => {
   try {
-    await supabaseAdmin
-      .from('notifications')
-      .update({ is_read: true, updated_at: new Date().toISOString() })
-      .eq('user_id', req.user.id)
-      .eq('is_read', false);
-
+    db.prepare('UPDATE notifications SET is_read = 1, updated_at = ? WHERE user_id = ? AND is_read = 0')
+      .run(new Date().toISOString(), req.user.id);
     res.json({ success: true, message: 'All notifications marked as read.' });
   } catch (error) {
     console.error('MarkAllAsRead error:', error);
@@ -68,18 +40,9 @@ const markAllAsRead = async (req, res) => {
   }
 };
 
-/**
- * Delete notification
- * DELETE /api/notifications/:id
- */
 const deleteNotification = async (req, res) => {
   try {
-    await supabaseAdmin
-      .from('notifications')
-      .delete()
-      .eq('id', req.params.id)
-      .eq('user_id', req.user.id);
-
+    db.prepare('DELETE FROM notifications WHERE id = ? AND user_id = ?').run(req.params.id, req.user.id);
     res.json({ success: true, message: 'Notification deleted.' });
   } catch (error) {
     console.error('DeleteNotification error:', error);

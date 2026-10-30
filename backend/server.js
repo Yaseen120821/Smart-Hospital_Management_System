@@ -148,18 +148,29 @@ app.use(notFound);
 app.use(errorHandler);
 
 // ============================================================
-// START SERVER
+// START SERVER (wait for SQLite DB to be ready first)
 // ============================================================
 
-app.listen(PORT, () => {
-  console.log('\n🏥 ================================');
-  console.log('   Smart Hospital Management System');
-  console.log('================================');
-  console.log(`✅ Server running on port ${PORT}`);
-  console.log(`🌍 Environment: ${process.env.NODE_ENV}`);
-  console.log(`📡 API URL: http://localhost:${PORT}`);
-  console.log(`🔗 Health: http://localhost:${PORT}/health`);
-  console.log('================================\n');
+const { waitReady } = require('./src/config/database');
+
+const startServer = async () => {
+  await waitReady();
+  app.listen(PORT, () => {
+    console.log('\n🏥 ================================');
+    console.log('   Smart Hospital Management System');
+    console.log('        (SQLite Edition)');
+    console.log('================================');
+    console.log(`✅ Server running on port ${PORT}`);
+    console.log(`🌍 Environment: ${process.env.NODE_ENV}`);
+    console.log(`📡 API URL: http://localhost:${PORT}`);
+    console.log(`🔗 Health: http://localhost:${PORT}/health`);
+    console.log('================================\n');
+  });
+};
+
+startServer().catch(err => {
+  console.error('❌ Failed to start server:', err);
+  process.exit(1);
 });
 
 module.exports = app;

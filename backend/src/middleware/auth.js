@@ -1,15 +1,16 @@
 /**
  * Authentication Middleware
  * Verifies JWT tokens and attaches user info to request
+ * Uses SQLite via better-sqlite3
  */
 
 const jwt = require('jsonwebtoken');
-const { supabaseAdmin } = require('../config/supabase');
+const { db } = require('../config/database');
 
 /**
  * Verify JWT token middleware
  */
-const authenticate = async (req, res, next) => {
+const authenticate = (req, res, next) => {
   try {
     const authHeader = req.headers.authorization;
 
@@ -25,14 +26,12 @@ const authenticate = async (req, res, next) => {
     // Verify JWT
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
-    // Fetch user from database to ensure they still exist
-    const { data: user, error } = await supabaseAdmin
-      .from('users')
-      .select('id, email, role, is_active, full_name')
-      .eq('id', decoded.userId)
-      .single();
+    // Fetch user from SQLite database
+    const user = db.prepare(
+      'SELECT id, email, role, is_active, full_name FROM users WHERE id = ?'
+    ).get(decoded.userId);
 
-    if (error || !user) {
+    if (!user) {
       return res.status(401).json({
         success: false,
         message: 'Invalid token. User not found.'

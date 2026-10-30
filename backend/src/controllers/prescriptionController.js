@@ -1,193 +1,132 @@
 /**
  * Prescription Controller
- * Handles prescription creation and management
+ * Uses SQLite via better-sqlite3
  */
 
-const { supabaseAdmin } = require('../config/supabase');
+const { v4: uuidv4 } = require('uuid');
+const { db } = require('../config/database');
 
-/**
- * Create prescription (doctor only)
- * POST /api/prescriptions
- */
 const createPrescription = async (req, res) => {
   try {
-    const {
-      appointment_id,
-      patient_id,
-      diagnosis,
-      medicines,
-      instructions,
-      follow_up_date,
-      notes
-    } = req.body;
+    const { appointment_id, patient_id, diagnosis, medicines, instructions, follow_up_date, notes } = req.body;
 
-    // Get doctor profile
-    const { data: doctor } = await supabaseAdmin
-      .from('doctors')
-      .select('id')
-      .eq('user_id', req.user.id)
-      .single();
+    const doctor = db.prepare('SELECT id FROM doctors WHERE user_id = ?').get(req.user.id);
+    if (!doctor) return res.status(404).json({ success: false, message: 'Doctor profile not found.' });
 
-    if (!doctor) {
-      return res.status(404).json({ success: false, message: 'Doctor profile not found.' });
-    }
+    const id = uuidv4();
+    const now = new Date().toISOString();
 
-    const { data: prescription, error } = await supabaseAdmin
-      .from('prescriptions')
-      .insert({
-        appointment_id,
-        patient_id,
-        doctor_id: doctor.id,
-        diagnosis,
-        medicines: JSON.stringify(medicines),
-        instructions,
-        follow_up_date,
-        notes
-      })
-      .select(`
-        *,
-        doctors(users(full_name), specialization, departments(name)),
-        patients(users(full_name, email))
-      `)
-      .single();
+    db.prepare(`INSERT INTO prescriptions (id, appointment_id, patient_id, doctor_id, diagnosis, medicines, instructions, follow_up_date, notes, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(id, appointment_id || null, patient_id, doctor.id, diagnosis, JSON.stringify(medicines || []), instructions, follow_up_date || null, notes, now, now);
 
-    if (error) {
-      console.error('Prescription creation error:', error);
-      return res.status(500).json({ success: false, message: 'Failed to create prescription.' });
-    }
+    const prescription = db.prepare(`
+      SELECT pr.*,
+        du.full_name AS doctor_name, d.specialization, dept.name AS dept_name,
+        pu.full_name AS patient_name, pu.email AS patient_email, p.user_id AS patient_user_id
+      FROM prescriptions pr
+      JOIN doctors d ON pr.doctor_id = d.id
+      JOIN users du ON d.user_id = du.id
+      LEFT JOIN departments dept ON d.department_id = dept.id
+      JOIN patients p ON pr.patient_id = p.id
+      JOIN users pu ON p.user_id = pu.id
+      WHERE pr.id = ?
+    `).get(id);
 
     // Notify patient
-    const patientUserId = prescription.patients?.user_id;
-    if (patientUserId) {
-      await supabaseAdmin.from('notifications').insert({
-        user_id: patientUserId,
-        title: 'New Prescription',
-        message: `Dr. ${prescription.doctors?.users?.full_name} has added a new prescription for you.`,
-        type: 'prescription'
-      });
+    if (prescription?.patient_user_id) {
+      db.prepare(`INSERT INTO notifications (id, user_id, title, message, type, created_at) VALUES (?,?,?,?,?,?)`)
+        .run(uuidv4(), prescription.patient_user_id, 'New Prescription', `Dr. ${prescription.doctor_name} has added a new prescription for you.`, 'prescription', now);
     }
 
-    res.status(201).json({
-      success: true,
-      message: 'Prescription created successfully.',
-      data: prescription
-    });
+    const result = { ...prescription, medicines: tryParse(prescription?.medicines, []) };
+    res.status(201).json({ success: true, message: 'Prescription created successfully.', data: result });
   } catch (error) {
     console.error('CreatePrescription error:', error);
     res.status(500).json({ success: false, message: 'Server error.' });
   }
 };
 
-/**
- * Get prescriptions
- * GET /api/prescriptions
- */
 const getPrescriptions = async (req, res) => {
   try {
-    let query = supabaseAdmin
-      .from('prescriptions')
-      .select(`
-        *,
-        doctors(id, specialization, users(full_name, avatar_url), departments(name)),
-        patients(id, users(full_name, email))
-      `);
+    let conditions = [];
+    let params = [];
 
     if (req.user.role === 'patient') {
-      const { data: patient } = await supabaseAdmin
-        .from('patients').select('id').eq('user_id', req.user.id).single();
-      if (patient) query = query.eq('patient_id', patient.id);
+      const patient = db.prepare('SELECT id FROM patients WHERE user_id = ?').get(req.user.id);
+      if (patient) { conditions.push('pr.patient_id = ?'); params.push(patient.id); }
     } else if (req.user.role === 'doctor') {
-      const { data: doctor } = await supabaseAdmin
-        .from('doctors').select('id').eq('user_id', req.user.id).single();
-      if (doctor) query = query.eq('doctor_id', doctor.id);
+      const doctor = db.prepare('SELECT id FROM doctors WHERE user_id = ?').get(req.user.id);
+      if (doctor) { conditions.push('pr.doctor_id = ?'); params.push(doctor.id); }
     }
 
-    const { data: prescriptions, error } = await query
-      .order('created_at', { ascending: false });
+    const where = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
 
-    if (error) {
-      return res.status(500).json({ success: false, message: 'Failed to fetch prescriptions.' });
-    }
+    const prescriptions = db.prepare(`
+      SELECT pr.*,
+        d.id AS doctor_profile_id, d.specialization,
+        du.full_name AS doctor_name, du.avatar_url AS doctor_avatar,
+        dept.name AS dept_name,
+        pu.full_name AS patient_name, pu.email AS patient_email
+      FROM prescriptions pr
+      JOIN doctors d ON pr.doctor_id = d.id
+      JOIN users du ON d.user_id = du.id
+      LEFT JOIN departments dept ON d.department_id = dept.id
+      JOIN patients p ON pr.patient_id = p.id
+      JOIN users pu ON p.user_id = pu.id
+      ${where}
+      ORDER BY pr.created_at DESC
+    `).all(...params);
 
-    // Parse medicines JSON
-    const parsedPrescriptions = prescriptions.map(p => ({
-      ...p,
-      medicines: typeof p.medicines === 'string' ? JSON.parse(p.medicines) : p.medicines
-    }));
-
-    res.json({ success: true, data: parsedPrescriptions });
+    const parsed = prescriptions.map(p => ({ ...p, medicines: tryParse(p.medicines, []) }));
+    res.json({ success: true, data: parsed });
   } catch (error) {
     console.error('GetPrescriptions error:', error);
     res.status(500).json({ success: false, message: 'Server error.' });
   }
 };
 
-/**
- * Get single prescription
- * GET /api/prescriptions/:id
- */
 const getPrescription = async (req, res) => {
   try {
-    const { data: prescription, error } = await supabaseAdmin
-      .from('prescriptions')
-      .select(`
-        *,
-        doctors(*, users(full_name, email, phone, avatar_url), departments(name)),
-        patients(*, users(full_name, email, phone)),
-        appointments(appointment_date, appointment_time)
-      `)
-      .eq('id', req.params.id)
-      .single();
+    const prescription = db.prepare(`
+      SELECT pr.*,
+        du.full_name AS doctor_name, du.email AS doctor_email, du.phone AS doctor_phone, du.avatar_url AS doctor_avatar,
+        d.specialization, dept.name AS dept_name,
+        pu.full_name AS patient_name, pu.email AS patient_email, pu.phone AS patient_phone,
+        a.appointment_date, a.appointment_time
+      FROM prescriptions pr
+      JOIN doctors d ON pr.doctor_id = d.id
+      JOIN users du ON d.user_id = du.id
+      LEFT JOIN departments dept ON d.department_id = dept.id
+      JOIN patients p ON pr.patient_id = p.id
+      JOIN users pu ON p.user_id = pu.id
+      LEFT JOIN appointments a ON pr.appointment_id = a.id
+      WHERE pr.id = ?
+    `).get(req.params.id);
 
-    if (error || !prescription) {
-      return res.status(404).json({ success: false, message: 'Prescription not found.' });
-    }
-
-    const parsedPrescription = {
-      ...prescription,
-      medicines: typeof prescription.medicines === 'string'
-        ? JSON.parse(prescription.medicines)
-        : prescription.medicines
-    };
-
-    res.json({ success: true, data: parsedPrescription });
+    if (!prescription) return res.status(404).json({ success: false, message: 'Prescription not found.' });
+    res.json({ success: true, data: { ...prescription, medicines: tryParse(prescription.medicines, []) } });
   } catch (error) {
     console.error('GetPrescription error:', error);
     res.status(500).json({ success: false, message: 'Server error.' });
   }
 };
 
-/**
- * Update prescription (doctor only)
- * PUT /api/prescriptions/:id
- */
 const updatePrescription = async (req, res) => {
   try {
     const { diagnosis, medicines, instructions, follow_up_date, notes } = req.body;
-
-    const { data: prescription, error } = await supabaseAdmin
-      .from('prescriptions')
-      .update({
-        diagnosis,
-        medicines: JSON.stringify(medicines),
-        instructions,
-        follow_up_date,
-        notes,
-        updated_at: new Date().toISOString()
-      })
-      .eq('id', req.params.id)
-      .select()
-      .single();
-
-    if (error) {
-      return res.status(500).json({ success: false, message: 'Failed to update prescription.' });
-    }
-
-    res.json({ success: true, message: 'Prescription updated.', data: prescription });
+    const now = new Date().toISOString();
+    db.prepare(`UPDATE prescriptions SET diagnosis=?, medicines=?, instructions=?, follow_up_date=?, notes=?, updated_at=? WHERE id=?`)
+      .run(diagnosis, JSON.stringify(medicines || []), instructions, follow_up_date || null, notes, now, req.params.id);
+    const prescription = db.prepare('SELECT * FROM prescriptions WHERE id = ?').get(req.params.id);
+    res.json({ success: true, message: 'Prescription updated.', data: { ...prescription, medicines: tryParse(prescription?.medicines, []) } });
   } catch (error) {
     console.error('UpdatePrescription error:', error);
     res.status(500).json({ success: false, message: 'Server error.' });
   }
 };
+
+function tryParse(val, fallback) {
+  try { return typeof val === 'string' ? JSON.parse(val) : val; } catch { return fallback; }
+}
 
 module.exports = { createPrescription, getPrescriptions, getPrescription, updatePrescription };

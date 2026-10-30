@@ -1,34 +1,28 @@
 /**
  * Queue Controller
- * Handles live queue management
+ * Uses SQLite via better-sqlite3
  */
 
-const { supabaseAdmin } = require('../config/supabase');
+const { v4: uuidv4 } = require('uuid');
+const { db } = require('../config/database');
 
-/**
- * Get queue for a doctor on a date
- * GET /api/queue/:doctorId
- */
 const getDoctorQueue = async (req, res) => {
   try {
     const { doctorId } = req.params;
     const { date } = req.query;
     const queueDate = date || new Date().toISOString().split('T')[0];
 
-    const { data: queue, error } = await supabaseAdmin
-      .from('queue_tokens')
-      .select(`
-        *,
-        patients(users(full_name, avatar_url)),
-        appointments(appointment_time, reason, type)
-      `)
-      .eq('doctor_id', doctorId)
-      .eq('appointment_date', queueDate)
-      .order('token_number');
-
-    if (error) {
-      return res.status(500).json({ success: false, message: 'Failed to fetch queue.' });
-    }
+    const queue = db.prepare(`
+      SELECT qt.*,
+        u.full_name AS patient_name, u.avatar_url AS patient_avatar,
+        a.appointment_time, a.reason, a.type
+      FROM queue_tokens qt
+      JOIN patients p ON qt.patient_id = p.id
+      JOIN users u ON p.user_id = u.id
+      JOIN appointments a ON qt.appointment_id = a.id
+      WHERE qt.doctor_id = ? AND qt.appointment_date = ?
+      ORDER BY qt.token_number
+    `).all(doctorId, queueDate);
 
     const stats = {
       total: queue.length,
@@ -45,33 +39,22 @@ const getDoctorQueue = async (req, res) => {
   }
 };
 
-/**
- * Get patient's queue position
- * GET /api/queue/position/:appointmentId
- */
 const getQueuePosition = async (req, res) => {
   try {
-    const { data: token } = await supabaseAdmin
-      .from('queue_tokens')
-      .select('*, appointments(appointment_date, doctor_id)')
-      .eq('appointment_id', req.params.appointmentId)
-      .single();
+    const token = db.prepare(`
+      SELECT qt.*, a.appointment_date, a.doctor_id
+      FROM queue_tokens qt JOIN appointments a ON qt.appointment_id = a.id
+      WHERE qt.appointment_id = ?
+    `).get(req.params.appointmentId);
 
-    if (!token) {
-      return res.status(404).json({ success: false, message: 'Queue token not found.' });
-    }
+    if (!token) return res.status(404).json({ success: false, message: 'Queue token not found.' });
 
-    // Count people ahead in queue
-    const { count: aheadCount } = await supabaseAdmin
-      .from('queue_tokens')
-      .select('*', { count: 'exact', head: true })
-      .eq('doctor_id', token.appointments?.doctor_id)
-      .eq('appointment_date', token.appointments?.appointment_date)
-      .lt('token_number', token.token_number)
-      .in('status', ['waiting', 'in_progress']);
+    const aheadCount = db.prepare(`
+      SELECT COUNT(*) AS count FROM queue_tokens
+      WHERE doctor_id = ? AND appointment_date = ? AND token_number < ? AND status IN ('waiting','in_progress')
+    `).get(token.doctor_id, token.appointment_date, token.token_number)?.count || 0;
 
-    // Estimated wait time (assuming 15 min per patient)
-    const estimatedWait = (aheadCount || 0) * 15;
+    const estimatedWait = aheadCount * 15;
 
     res.json({
       success: true,
@@ -79,8 +62,8 @@ const getQueuePosition = async (req, res) => {
         token_code: token.token_code,
         token_number: token.token_number,
         status: token.status,
-        position: (aheadCount || 0) + 1,
-        people_ahead: aheadCount || 0,
+        position: aheadCount + 1,
+        people_ahead: aheadCount,
         estimated_wait_minutes: estimatedWait
       }
     });
@@ -90,25 +73,12 @@ const getQueuePosition = async (req, res) => {
   }
 };
 
-/**
- * Update queue token status
- * PUT /api/queue/:tokenId/status
- */
 const updateQueueStatus = async (req, res) => {
   try {
     const { status } = req.body;
-
-    const { data: token, error } = await supabaseAdmin
-      .from('queue_tokens')
-      .update({ status, updated_at: new Date().toISOString() })
-      .eq('id', req.params.tokenId)
-      .select()
-      .single();
-
-    if (error) {
-      return res.status(500).json({ success: false, message: 'Failed to update queue.' });
-    }
-
+    const now = new Date().toISOString();
+    db.prepare('UPDATE queue_tokens SET status = ?, updated_at = ? WHERE id = ?').run(status, now, req.params.tokenId);
+    const token = db.prepare('SELECT * FROM queue_tokens WHERE id = ?').get(req.params.tokenId);
     res.json({ success: true, message: 'Queue updated.', data: token });
   } catch (error) {
     console.error('UpdateQueueStatus error:', error);
@@ -116,59 +86,37 @@ const updateQueueStatus = async (req, res) => {
   }
 };
 
-/**
- * Call next patient
- * POST /api/queue/:doctorId/next
- */
 const callNextPatient = async (req, res) => {
   try {
     const { doctorId } = req.params;
     const today = new Date().toISOString().split('T')[0];
+    const now = new Date().toISOString();
 
     // Complete current in-progress
-    await supabaseAdmin
-      .from('queue_tokens')
-      .update({ status: 'completed', updated_at: new Date().toISOString() })
-      .eq('doctor_id', doctorId)
-      .eq('appointment_date', today)
-      .eq('status', 'in_progress');
+    db.prepare(`UPDATE queue_tokens SET status = 'completed', updated_at = ? WHERE doctor_id = ? AND appointment_date = ? AND status = 'in_progress'`)
+      .run(now, doctorId, today);
 
-    // Get next waiting patient
-    const { data: nextToken } = await supabaseAdmin
-      .from('queue_tokens')
-      .select('*, patients(users(full_name))')
-      .eq('doctor_id', doctorId)
-      .eq('appointment_date', today)
-      .eq('status', 'waiting')
-      .order('token_number')
-      .limit(1)
-      .single();
+    // Get next waiting
+    const nextToken = db.prepare(`
+      SELECT qt.*, u.full_name AS patient_name, p.user_id AS patient_user_id
+      FROM queue_tokens qt
+      JOIN patients p ON qt.patient_id = p.id
+      JOIN users u ON p.user_id = u.id
+      WHERE qt.doctor_id = ? AND qt.appointment_date = ? AND qt.status = 'waiting'
+      ORDER BY qt.token_number LIMIT 1
+    `).get(doctorId, today);
 
-    if (!nextToken) {
-      return res.json({ success: true, message: 'No more patients in queue.', data: null });
-    }
+    if (!nextToken) return res.json({ success: true, message: 'No more patients in queue.', data: null });
 
-    // Set next patient as in_progress
-    await supabaseAdmin
-      .from('queue_tokens')
-      .update({ status: 'in_progress', updated_at: new Date().toISOString() })
-      .eq('id', nextToken.id);
+    db.prepare(`UPDATE queue_tokens SET status = 'in_progress', updated_at = ? WHERE id = ?`).run(now, nextToken.id);
 
     // Notify patient
-    if (nextToken.patients?.user_id) {
-      await supabaseAdmin.from('notifications').insert({
-        user_id: nextToken.patients.user_id,
-        title: 'Your Turn!',
-        message: `Token ${nextToken.token_code} - Please proceed to the doctor's room.`,
-        type: 'queue'
-      });
+    if (nextToken.patient_user_id) {
+      db.prepare(`INSERT INTO notifications (id, user_id, title, message, type, created_at) VALUES (?,?,?,?,?,?)`)
+        .run(uuidv4(), nextToken.patient_user_id, 'Your Turn!', `Token ${nextToken.token_code} - Please proceed to the doctor's room.`, 'queue', now);
     }
 
-    res.json({
-      success: true,
-      message: `Now calling token ${nextToken.token_code}`,
-      data: nextToken
-    });
+    res.json({ success: true, message: `Now calling token ${nextToken.token_code}`, data: nextToken });
   } catch (error) {
     console.error('CallNextPatient error:', error);
     res.status(500).json({ success: false, message: 'Server error.' });
